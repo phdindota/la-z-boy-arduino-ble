@@ -1,20 +1,23 @@
 /**
  * ╔═══════════════════════════════════════════════════════════════════════════╗
  * ║              LA-Z-BOY BLE WIRELESS REMOTE CONTROLLER                      ║
- * ║                         Version 1.2                                        ║
+ * ║                         Version 2.0                                        ║
  * ╠═══════════════════════════════════════════════════════════════════════════╣
  * ║  Controls La-Z-Boy power recliners via BLE by emulating the wireless      ║
  * ║  remote. Supports Serial commands and MQTT for Home Assistant.            ║
  * ║                                                                           ║
+ * ║  REQUIRES: Patched NimBLE-Arduino library (run setup.sh first!)           ║
+ * ║                                                                           ║
  * ║  COMMANDS:                                                                ║
  * ║    Presets:  home, flat, tv              (tap to activate)                ║
- * ║    Save:     save_flat, save_tv          (3.5 sec hold per manual)          ║
+ * ║    Save:     save_flat, save_tv          (3.5 sec hold per manual)        ║
  * ║    Motors:   head_up/down, recline_up/down, lumbar_up/down                ║
  * ║    Timed:    command:ms  (e.g., head_up:500 for half second)              ║
+ * ║    System:   status, wipe, handles, help                                  ║
  * ║                                                                           ║
  * ║  SAVE PROTOCOL (exact timing from capture):                               ║
- * ║    Byte 2: 0x09 = Press, 0x03 = Hold, 0x0A = Release                      ║
- * ║    Sequence: Press(09) 2.0s → Hold(03) 1.5s → Release(0A) = 3.5s total    ║
+ * ║    Byte 2: 0x09 = Press, 0x03 = Hold, 0x0A = Release                     ║
+ * ║    Sequence: Press(09) 2.0s -> Hold(03) 1.5s -> Release(0A) = 3.5s total ║
  * ║                                                                           ║
  * ║  MQTT Topic: lazboy/command                                               ║
  * ╚═══════════════════════════════════════════════════════════════════════════╝
@@ -49,6 +52,35 @@ const char* MQTT_TOPIC    = "lazboy/command";
 uint8_t REMOTE_MAC[6] = {0x00, 0x01, 0x90, 0x82, 0xB2, 0x4E};
 
 // =============================================================================
+//                         HANDLE VERIFICATION
+// =============================================================================
+//
+// The chair hardcodes GATT handle positions. After bonding, it expects:
+//
+//   Handle  | What
+//   --------|-------------------------------
+//   0x000B  | La-Z-Boy Service declaration
+//   0x000C  | Notify char declaration
+//   0x000D  | Notify VALUE              <-- critical
+//   0x000E  | Notify CCCD               <-- critical
+//   0x000F  | Write char declaration
+//   0x0010  | Write VALUE
+//   0x0011  | Bidir char declaration
+//   0x0012  | Bidir VALUE
+//   0x0013  | Bidir CCCD
+//
+// This requires the patched NimBLE library (run setup.sh) which removes
+// the GATT Service Changed characteristic, freeing 3 handle slots.
+//
+// Without the patch: Notify VALUE lands at 0x0010 (too high, chair ignores)
+// With the patch:    Notify VALUE lands at 0x000D (correct, chair responds)
+
+#define TARGET_NOTIFY_VALUE  0x000D
+#define TARGET_NOTIFY_CCCD   0x000E
+#define TARGET_BIDIR_VALUE   0x0012
+#define TARGET_BIDIR_CCCD    0x0013
+
+// =============================================================================
 //                         BLE PROTOCOL CONSTANTS
 // =============================================================================
 
@@ -67,26 +99,24 @@ uint8_t REMOTE_MAC[6] = {0x00, 0x01, 0x90, 0x82, 0xB2, 0x4E};
 struct Command {
     const char* name;
     uint8_t press[4];
-    uint8_t hold[4];     // NEW: Hold packet (byte 2 = 0x03)
+    uint8_t hold[4];     // Hold packet (byte 2 = 0x03)
     uint8_t release[4];
     int holdMs;
-    bool hasSaveMode;    // NEW: Does this command use the hold packet?
+    bool hasSaveMode;    // Does this command use the hold packet?
 };
 
-// Commands with proper hold sequence for save functionality
-// Save sequence (from capture): press(09) 2.0s → hold(03) 1.5s → release(0A) = 3.5s total
+// Save sequence (from capture): press(09) 2.0s -> hold(03) 1.5s -> release(0A) = 3.5s total
 Command commands[] = {
-    // PRESETS - 3-byte format (quick tap to activate)
+    // PRESETS - quick tap to activate
     {"home",         {0x93, 0x09, 0x00, 0x00}, {0x00, 0x00, 0x00, 0x00}, {0x93, 0x0A, 0x00, 0x00}, 200, false},
     {"flat",         {0x98, 0x09, 0x00, 0x00}, {0x00, 0x00, 0x00, 0x00}, {0x98, 0x0A, 0x00, 0x00}, 200, false},
     {"tv",           {0x94, 0x09, 0x00, 0x00}, {0x00, 0x00, 0x00, 0x00}, {0x94, 0x0A, 0x00, 0x00}, 200, false},
     
-    // SAVE PRESETS - 4-byte format with hold sequence from capture
-    // Remote sends exactly 3 packets: press, hold at +2s, release at +3.6s
+    // SAVE PRESETS - 3-packet hold sequence
     {"save_flat",    {0x98, 0x09, 0x00, 0x01}, {0x98, 0x03, 0x00, 0x01}, {0x98, 0x0A, 0x00, 0x00}, 3500, true},
     {"save_tv",      {0x94, 0x09, 0x00, 0x02}, {0x94, 0x03, 0x00, 0x02}, {0x94, 0x0A, 0x00, 0x00}, 3500, true},
     
-    // Motors - 3-byte format
+    // MOTORS - continuous press
     {"recline_up",   {0x11, 0x09, 0x02, 0x00}, {0x00, 0x00, 0x00, 0x00}, {0x11, 0x0A, 0x00, 0x00}, 1000, false},
     {"recline_down", {0x12, 0x09, 0x01, 0x00}, {0x00, 0x00, 0x00, 0x00}, {0x12, 0x0A, 0x00, 0x00}, 1000, false},
     {"feet_up",      {0x11, 0x09, 0x02, 0x00}, {0x00, 0x00, 0x00, 0x00}, {0x11, 0x0A, 0x00, 0x00}, 1000, false},
@@ -117,6 +147,58 @@ bool chairConnected = false;
 uint16_t connHandle = 0;
 
 // =============================================================================
+//                         HANDLE DIAGNOSTIC
+// =============================================================================
+
+void printHandleDiagnostic() {
+    uint16_t nv = notifyChar ? notifyChar->getHandle() : 0;
+    uint16_t nc = notifyCCCD ? notifyCCCD->getHandle() : 0;
+    uint16_t wv = writeChar  ? writeChar->getHandle()  : 0;
+    uint16_t bv = bidirChar  ? bidirChar->getHandle()  : 0;
+    uint16_t bc = bidirCCCD  ? bidirCCCD->getHandle()  : 0;
+    
+    bool notifyOk = (nv == TARGET_NOTIFY_VALUE);
+    bool cccdOk   = (nc == TARGET_NOTIFY_CCCD);
+    bool bidirOk  = (bv == TARGET_BIDIR_VALUE);
+    bool bcccdOk  = (bc == TARGET_BIDIR_CCCD);
+    bool allOk    = notifyOk && cccdOk && bidirOk && bcccdOk;
+    
+    Serial.println();
+    Serial.println("============================================================");
+    Serial.println("                  GATT HANDLE DIAGNOSTIC                     ");
+    Serial.println("============================================================");
+    Serial.printf( "  Notify VALUE:  0x%04X  (target 0x%04X)  %s\n",
+                   nv, TARGET_NOTIFY_VALUE, notifyOk ? "OK" : "<-- WRONG");
+    Serial.printf( "  Notify CCCD:   0x%04X  (target 0x%04X)  %s\n",
+                   nc, TARGET_NOTIFY_CCCD,  cccdOk  ? "OK" : "<-- WRONG");
+    Serial.printf( "  Write VALUE:   0x%04X\n", wv);
+    Serial.printf( "  Bidir VALUE:   0x%04X  (target 0x%04X)  %s\n",
+                   bv, TARGET_BIDIR_VALUE,  bidirOk ? "OK" : "<-- WRONG");
+    Serial.printf( "  Bidir CCCD:    0x%04X  (target 0x%04X)  %s\n",
+                   bc, TARGET_BIDIR_CCCD,   bcccdOk ? "OK" : "<-- WRONG");
+    Serial.println("------------------------------------------------------------");
+    
+    if (allOk) {
+        Serial.println("  >>> ALL HANDLES CORRECT <<<");
+    } else if (nv == 0) {
+        Serial.println("  Handles show 0x0000 - NimBLE may not report until");
+        Serial.println("  after first connection. Type 'handles' after chair");
+        Serial.println("  connects to re-check.");
+    } else {
+        int diff = (int)nv - (int)TARGET_NOTIFY_VALUE;
+        Serial.printf( "  Notify VALUE is off by %+d handle(s)\n\n", diff);
+        if (diff > 0) {
+            Serial.println("  NimBLE patch may not be applied correctly.");
+            Serial.println("  Run setup.sh or see patches/README for manual steps.");
+        } else {
+            Serial.println("  Unexpected: handles too low. Check NimBLE version.");
+        }
+    }
+    Serial.println("============================================================");
+    Serial.println();
+}
+
+// =============================================================================
 //                         BLE FUNCTIONS
 // =============================================================================
 
@@ -126,23 +208,22 @@ void enableNotifications() {
     if (bidirCCCD) bidirCCCD->setValue(enabled, 2);
 }
 
-// Callback to capture what the chair writes to us
 class CharCallbacks : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic* pChar, NimBLEConnInfo& connInfo) override {
         std::string value = pChar->getValue();
-        Serial.printf("← Chair wrote to %s: ", pChar->getUUID().toString().c_str());
-        for (int i = 0; i < value.length() && i < 20; i++) {
+        Serial.printf("<- Chair wrote to %s: ", pChar->getUUID().toString().c_str());
+        for (size_t i = 0; i < value.length() && i < 20; i++) {
             Serial.printf("%02X ", (uint8_t)value[i]);
         }
         Serial.println();
     }
     
     void onRead(NimBLECharacteristic* pChar, NimBLEConnInfo& connInfo) override {
-        Serial.printf("← Chair read from %s\n", pChar->getUUID().toString().c_str());
+        Serial.printf("<- Chair read from %s\n", pChar->getUUID().toString().c_str());
     }
     
     void onSubscribe(NimBLECharacteristic* pChar, NimBLEConnInfo& connInfo, uint16_t subValue) override {
-        Serial.printf("← Chair subscribed to %s (value: %d)\n", 
+        Serial.printf("<- Chair subscribed to %s (value: %d)\n", 
                       pChar->getUUID().toString().c_str(), subValue);
     }
 };
@@ -153,22 +234,22 @@ class BLECallbacks : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer* server, NimBLEConnInfo& connInfo) override {
         chairConnected = true;
         connHandle = connInfo.getConnHandle();
-        Serial.printf("✓ Chair connected: %s\n", connInfo.getAddress().toString().c_str());
+        Serial.printf(">> Chair connected: %s\n", connInfo.getAddress().toString().c_str());
         NimBLEDevice::startSecurity(connHandle);
     }
     
     void onDisconnect(NimBLEServer* server, NimBLEConnInfo& connInfo, int reason) override {
         chairConnected = false;
         connHandle = 0;
-        Serial.printf("✗ Chair disconnected (reason: %d)\n", reason);
+        Serial.printf(">> Chair disconnected (reason: %d)\n", reason);
         delay(500);
         NimBLEDevice::startAdvertising();
     }
     
     void onAuthenticationComplete(NimBLEConnInfo& connInfo) override {
-        Serial.printf("✓ Authenticated (bonded: %s)\n", connInfo.isBonded() ? "yes" : "no");
+        Serial.printf(">> Authenticated (bonded: %s)\n", connInfo.isBonded() ? "yes" : "no");
         enableNotifications();
-        Serial.println("✓ Ready for commands!\n");
+        Serial.println(">> Ready for commands!\n");
     }
 };
 
@@ -178,7 +259,7 @@ class BLECallbacks : public NimBLEServerCallbacks {
 
 void sendCommand(Command& cmd, int customHoldMs = -1) {
     if (!chairConnected) {
-        Serial.println("✗ Not connected to chair");
+        Serial.println("!! Not connected to chair");
         return;
     }
     
@@ -186,7 +267,6 @@ void sendCommand(Command& cmd, int customHoldMs = -1) {
     
     enableNotifications();
     
-    // Build 20-byte packets
     uint8_t pressPacket[20] = {0};
     uint8_t holdPacket[20] = {0};
     uint8_t releasePacket[20] = {0};
@@ -201,49 +281,35 @@ void sendCommand(Command& cmd, int customHoldMs = -1) {
         // 2. Hold packet at T=2.0s
         // 3. Release packet at T=3.6s
         
-        Serial.printf("→ %s (SAVE MODE - single packets)\n", cmd.name);
-        Serial.printf("  Press packet: %02X %02X %02X %02X\n", 
-                      pressPacket[0], pressPacket[1], pressPacket[2], pressPacket[3]);
-        Serial.printf("  Hold packet:  %02X %02X %02X %02X\n", 
-                      holdPacket[0], holdPacket[1], holdPacket[2], holdPacket[3]);
-        Serial.printf("  Release packet: %02X %02X %02X %02X\n", 
-                      releasePacket[0], releasePacket[1], releasePacket[2], releasePacket[3]);
+        Serial.printf("-> %s (SAVE MODE)\n", cmd.name);
         
-        // T=0: Send ONE press packet
-        Serial.println("  [T=0.0s] Sending PRESS (09)...");
+        Serial.println("  [T=0.0s] PRESS");
         notifyChar->setValue(pressPacket, 20);
         notifyChar->notify(connHandle);
         bidirChar->setValue(pressPacket, 20);
         bidirChar->notify(connHandle);
         
-        // Wait 2 seconds
         delay(2000);
         
-        // T=2.0s: Send ONE hold packet
-        Serial.println("  [T=2.0s] Sending HOLD (03)...");
+        Serial.println("  [T=2.0s] HOLD");
         notifyChar->setValue(holdPacket, 20);
         notifyChar->notify(connHandle);
         bidirChar->setValue(holdPacket, 20);
         bidirChar->notify(connHandle);
         
-        // Wait 1.6 seconds (matching capture: 27.419 - 25.812 = 1.607s)
         delay(1600);
         
-        // T=3.6s: Send ONE release packet
-        Serial.println("  [T=3.6s] Sending RELEASE (0A)...");
-        
-        // Skip the release code at the end since we handle it here
+        Serial.println("  [T=3.6s] RELEASE");
         notifyChar->setValue(releasePacket, 20);
         notifyChar->notify(connHandle);
         bidirChar->setValue(releasePacket, 20);
         bidirChar->notify(connHandle);
         
-        Serial.println("✓ Done");
-        return;  // Exit early, don't send release again
+        Serial.println(">> Done");
+        return;
         
     } else {
-        // NORMAL SEQUENCE: Just press for duration
-        Serial.printf("→ %s (%d ms)\n", cmd.name, holdMs);
+        Serial.printf("-> %s (%d ms)\n", cmd.name, holdMs);
         
         unsigned long startTime = millis();
         while (millis() - startTime < (unsigned long)holdMs) {
@@ -255,13 +321,12 @@ void sendCommand(Command& cmd, int customHoldMs = -1) {
         }
     }
     
-    // Send release
     notifyChar->setValue(releasePacket, 20);
     notifyChar->notify(connHandle);
     bidirChar->setValue(releasePacket, 20);
     bidirChar->notify(connHandle);
     
-    Serial.println("✓ Done");
+    Serial.println(">> Done");
 }
 
 void executeCommand(const char* input) {
@@ -269,7 +334,6 @@ void executeCommand(const char* input) {
     cmd.trim();
     cmd.toLowerCase();
     
-    // Check for timed command (e.g., "head_up:500")
     int colonIdx = cmd.indexOf(':');
     int customTime = -1;
     
@@ -278,7 +342,6 @@ void executeCommand(const char* input) {
         cmd = cmd.substring(0, colonIdx);
     }
     
-    // Find and execute command
     for (int i = 0; i < NUM_COMMANDS; i++) {
         if (cmd.equals(commands[i].name)) {
             sendCommand(commands[i], customTime);
@@ -286,7 +349,7 @@ void executeCommand(const char* input) {
         }
     }
     
-    Serial.printf("✗ Unknown command: %s\n", input);
+    Serial.printf("!! Unknown command: %s\n", input);
 }
 
 // =============================================================================
@@ -306,7 +369,7 @@ void connectMqtt() {
     String clientId = "lazboy-" + String(random(0xffff), HEX);
     if (mqtt.connect(clientId.c_str(), MQTT_USER, MQTT_PASSWORD)) {
         mqtt.subscribe(MQTT_TOPIC);
-        Serial.println("✓ MQTT connected");
+        Serial.println(">> MQTT connected");
     }
 }
 
@@ -319,9 +382,9 @@ void setup() {
     delay(1000);
     
     Serial.println();
-    Serial.println("╔═════════════════════════════════════════╗");
-    Serial.println("║   LA-Z-BOY BLE CONTROLLER v1.2          ║");
-    Serial.println("╚═════════════════════════════════════════╝");
+    Serial.println("============================================");
+    Serial.println("   LA-Z-BOY BLE CONTROLLER v2.0");
+    Serial.println("============================================");
     Serial.println();
     
     // --- WiFi ---
@@ -333,9 +396,9 @@ void setup() {
             Serial.print(".");
         }
         if (WiFi.status() == WL_CONNECTED) {
-            Serial.printf("\n✓ WiFi: %s\n", WiFi.localIP().toString().c_str());
+            Serial.printf("\n>> WiFi: %s\n", WiFi.localIP().toString().c_str());
         } else {
-            Serial.println("\n✗ WiFi failed (continuing offline)");
+            Serial.println("\n!! WiFi failed (continuing offline)");
         }
     }
     
@@ -364,21 +427,24 @@ void setup() {
     bleServer = NimBLEDevice::createServer();
     bleServer->setCallbacks(new BLECallbacks());
     
-    // Padding service (for GATT handle alignment)
-    NimBLEService* padService = bleServer->createService("0000fee0-0000-1000-8000-00805f9b34fb");
-    NimBLECharacteristic* padChar = padService->createCharacteristic(
-        "0000fe00-0000-1000-8000-00805f9b34fb",
-        NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
-    padChar->setValue((uint8_t*)"\x00", 1);
-    padChar->createDescriptor("2902", NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE, 2)
-           ->setValue((uint8_t*)"\x00\x00", 2);
-    padChar->createDescriptor("2901", NIMBLE_PROPERTY::READ, 8)
-           ->setValue((uint8_t*)"Padding", 7);
-    padService->start();
-    
-    // La-Z-Boy service
+    // =========================================================================
+    // LA-Z-BOY SERVICE
+    //
+    // No padding service needed - the NimBLE patch removes 3 handles from the
+    // GATT service, which places our service at exactly the right offset.
+    //
+    // Handle layout (with patch applied):
+    //   0x0001-0x0005: GAP service (Device Name + Appearance)
+    //   0x0006-0x000A: GATT service (Srv Sup Feat + Client Sup Feat)
+    //   0x000B:        LZB Service declaration
+    //   0x000C:        Notify char declaration
+    //   0x000D:        Notify VALUE          <-- chair reads here
+    //   0x000E:        Notify CCCD           <-- chair subscribes here
+    //   0x000F-0x0013: Write, Bidir, Read characteristics
+    // =========================================================================
     NimBLEService* lzbService = bleServer->createService(SERVICE_UUID);
     
+    // Notify characteristic (main command channel)
     notifyChar = lzbService->createCharacteristic(CHAR_NOTIFY_UUID,
         NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
     notifyChar->setValue((uint8_t*)"\x00\x00\x00", 3);
@@ -387,11 +453,13 @@ void setup() {
         NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE, 2);
     notifyCCCD->setValue((uint8_t*)"\x00\x00", 2);
     
+    // Write characteristic
     writeChar = lzbService->createCharacteristic(CHAR_WRITE_UUID,
         NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::WRITE);
     writeChar->setValue((uint8_t*)"\x00\x00\x00", 3);
     writeChar->setCallbacks(&charCallbacks);
     
+    // Bidirectional characteristic
     bidirChar = lzbService->createCharacteristic(CHAR_BIDIR_UUID,
         NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::NOTIFY);
     bidirChar->setValue((uint8_t*)"\x00\x00\x00", 3);
@@ -400,11 +468,15 @@ void setup() {
         NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE, 2);
     bidirCCCD->setValue((uint8_t*)"\x00\x00", 2);
     
+    // Read characteristic
     NimBLECharacteristic* readChar = lzbService->createCharacteristic(CHAR_READ_UUID, NIMBLE_PROPERTY::READ);
     readChar->setValue((uint8_t*)"\x00", 1);
     readChar->setCallbacks(&charCallbacks);
     
     lzbService->start();
+    
+    // --- Handle diagnostic ---
+    printHandleDiagnostic();
     
     // --- Advertising ---
     NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
@@ -417,7 +489,6 @@ void setup() {
     adv->start();
     
     // --- Print Help ---
-    Serial.println();
     Serial.println("COMMANDS:");
     Serial.println("  Presets:  home, flat, tv");
     Serial.println("  Save:     save_flat, save_tv (3.5 sec hold)");
@@ -425,7 +496,7 @@ void setup() {
     Serial.println("  Recline:  recline_up, recline_down (or feet_up/down)");
     Serial.println("  Lumbar:   lumbar_up, lumbar_down");
     Serial.println("  Timed:    command:ms (e.g., head_up:500)");
-    Serial.println("  System:   status, wipe, help");
+    Serial.println("  System:   status, wipe, handles, help");
     Serial.println();
     Serial.printf("MQTT Topic: %s\n", MQTT_TOPIC);
     Serial.println();
@@ -438,13 +509,11 @@ void setup() {
 // =============================================================================
 
 void loop() {
-    // MQTT maintenance
     if (WiFi.status() == WL_CONNECTED && strlen(MQTT_SERVER) > 0) {
         if (!mqtt.connected()) connectMqtt();
         mqtt.loop();
     }
     
-    // Serial commands
     if (Serial.available()) {
         String input = Serial.readStringUntil('\n');
         input.trim();
@@ -457,7 +526,10 @@ void loop() {
         }
         else if (input.equalsIgnoreCase("wipe")) {
             NimBLEDevice::deleteAllBonds();
-            Serial.println("✓ Bonds cleared - re-pair required");
+            Serial.println(">> Bonds cleared - re-pair required");
+        }
+        else if (input.equalsIgnoreCase("handles")) {
+            printHandleDiagnostic();
         }
         else if (input.equalsIgnoreCase("help") || input.equals("?")) {
             Serial.println("COMMANDS:");
@@ -467,7 +539,7 @@ void loop() {
             Serial.println("  Recline:  recline_up, recline_down");
             Serial.println("  Lumbar:   lumbar_up, lumbar_down");
             Serial.println("  Timed:    command:ms (e.g., head_up:500)");
-            Serial.println("  System:   status, wipe, help");
+            Serial.println("  System:   status, wipe, handles, help");
         }
         else if (input.length() > 0) {
             executeCommand(input.c_str());

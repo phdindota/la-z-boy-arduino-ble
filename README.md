@@ -2,7 +2,34 @@
 
 Control La-Z-Boy power recliners via BLE using an ESP32, with optional MQTT integration for Home Assistant.
 
-The ESP32 emulates the La-Z-Boy wireless remote by acting as a BLE peripheral. The chair (which acts as a BLE central) connects to the ESP32 and accepts motor/preset commands over GATT notifications — exactly as it would from the original remote.
+The ESP32 emulates the La-Z-Boy wireless remote by acting as a BLE peripheral. The chair (which acts as BLE central) connects to the ESP32 and accepts motor/preset commands over GATT notifications — exactly as it would from the original remote.
+
+## Quick Start
+
+```bash
+# 1. Clone
+git clone https://github.com/YOUR_USER/lazboy-ble-controller.git
+cd lazboy-ble-controller
+
+# 2. Install libraries in Arduino IDE:
+#    - NimBLE-Arduino by h2zero (search "NimBLE" in Library Manager)
+#    - PubSubClient by Nick O'Leary
+
+# 3. Patch NimBLE (required — see why below)
+chmod +x setup.sh
+./setup.sh
+
+# 4. Edit src/lazboy_ble_controller.ino:
+#    - Set REMOTE_MAC to your remote's MAC (subtract 2 from last byte)
+#    - Optionally set WiFi + MQTT credentials
+
+# 5. Flash and open Serial Monitor at 115200
+
+# 6. Factory reset the chair pairing:
+#    - Unplug chair, hold Home on original remote, plug in, release after 5s
+
+# 7. Chair connects, type: head_up
+```
 
 ## How It Works
 
@@ -12,80 +39,64 @@ This firmware:
 
 1. Spoofs the original remote's BLE MAC address
 2. Advertises with the same service UUID and manufacturer data
-3. Creates a GATT server with the correct service/characteristic layout (including a padding service for handle alignment)
+3. Creates a GATT server with the La-Z-Boy service and characteristics
 4. Accepts the chair's connection and completes bonding
 5. Sends command packets as notifications on two characteristics simultaneously
 
-Commands are 3–4 byte sequences where byte 2 encodes the action: `0x09` = press, `0x03` = hold, `0x0A` = release.
+Commands are 3-4 byte sequences where byte 2 encodes the action: `0x09` = press, `0x03` = hold, `0x0A` = release.
 
 ## Hardware Required
 
-- **ESP32** development board (ESP32-WROOM or ESP32-DevKitC recommended)
+- **ESP32** development board (ESP32-WROOM or ESP32-DevKitC)
 - USB cable for flashing and serial monitor
-- (Optional) Permanent 5V power supply for always-on operation
 
-No additional components are needed — just the ESP32.
+No additional components needed.
 
 ## Software Dependencies
 
-This project uses the **Arduino framework** with the following libraries:
+| Library | Version Tested | Purpose |
+|---------|---------------|---------|
+| [NimBLE-Arduino](https://github.com/h2zero/NimBLE-Arduino) | 2.3.9 | BLE stack (requires patch, see below) |
+| [PubSubClient](https://github.com/knolleary/pubsubclient) | 2.8+ | Optional MQTT client |
+| ESP32 Arduino Core | 3.3.7 | Board support |
 
-| Library | Purpose |
-|---------|---------|
-| [NimBLE-Arduino](https://github.com/h2zero/NimBLE-Arduino) | BLE stack (lighter and more reliable than the default ESP32 BLE library) |
-| WiFi (built-in) | Optional WiFi connectivity |
-| [PubSubClient](https://github.com/knolleary/pubsubclient) | Optional MQTT client |
+## NimBLE Patch (Required)
 
-Install via Arduino Library Manager or PlatformIO.
+La-Z-Boy chairs **hardcode GATT handle positions** in their firmware. The chair expects the notify characteristic at handle `0x000D`. If it's anywhere else, the chair connects but silently ignores all commands.
+
+NimBLE's built-in GATT Service Changed characteristic consumes 3 handle slots that push our service to the wrong position. The patch comments out this one characteristic — a 6-line change in one file.
+
+```bash
+# Apply automatically:
+./setup.sh
+
+# Or manually: see patches/README.md
+```
+
+The Service Changed characteristic tells BLE clients when the GATT table changes at runtime. Since our table is static, removing it has zero functional impact. See [patches/README.md](patches/README.md) for the full technical explanation and handle layout.
+
+After the patch, type `handles` in Serial Monitor to verify all handles show `OK`.
 
 ## Setup
 
 ### 1. Find Your Remote's MAC Address
 
-You need the BLE MAC address of your **original La-Z-Boy remote**. Use a BLE scanner app (e.g., nRF Connect) to find a device advertising as `LZB-SHL` or similar.
+Use a BLE scanner app (nRF Connect) to find a device advertising as `LZB-SHL`.
 
-> **Important:** The ESP32 adds +2 to the base MAC for BLE. If your remote's BLE MAC ends in `0x50`, set the last byte in `REMOTE_MAC` to `0x4E` (i.e., `0x50 - 2`).
+**Important:** The ESP32 adds +2 to the base MAC for BLE. If your remote's BLE MAC ends in `0x50`, set the last byte in `REMOTE_MAC` to `0x4E` (i.e., `0x50 - 2`).
 
 ### 2. Unpair the Original Remote
 
-The chair can only bond with one remote at a time. You need to **factory reset the chair's pairing**:
+The chair bonds with one remote at a time. Factory reset the chair's pairing:
 
 1. Unplug the chair from power
 2. Hold the Home button on the original remote
 3. Plug the chair back in while still holding Home
-4. Release after ~5 seconds — the chair should be in pairing mode
+4. Release after ~5 seconds
 
-### 3. Configure the Sketch
+### 3. Configure and Flash
 
-Edit the configuration section at the top of `src/lazboy_ble_controller.ino`:
-
-```cpp
-// Your remote's MAC (remember: subtract 2 from the last byte)
-uint8_t REMOTE_MAC[6] = {0x00, 0x01, 0x90, 0x82, 0xB2, 0x4E};
-
-// Optional: WiFi + MQTT for Home Assistant
-const char* WIFI_SSID     = "YourNetwork";
-const char* WIFI_PASSWORD  = "YourPassword";
-const char* MQTT_SERVER    = "192.168.1.100";
-```
-
-Leave WiFi/MQTT fields empty to run in serial-only mode.
-
-### 4. Flash and Run
-
-1. Open the sketch in Arduino IDE or PlatformIO
-2. Select your ESP32 board
-3. Upload
-4. Open Serial Monitor at 115200 baud
-5. Power cycle the chair — it should connect and bond within a few seconds
-
-You'll see:
-
-```
-✓ Chair connected: xx:xx:xx:xx:xx:xx
-✓ Authenticated (bonded: yes)
-✓ Ready for commands!
-```
+Edit the configuration section in `src/lazboy_ble_controller.ino`, flash, and open Serial Monitor at 115200 baud.
 
 ## Commands
 
@@ -106,6 +117,7 @@ Send commands via Serial Monitor or publish to the MQTT topic (`lazboy/command` 
 | `lumbar_up` / `lumbar_down` | Lumbar motor |
 | `status` | Print connection status |
 | `wipe` | Clear BLE bonds (re-pair required) |
+| `handles` | Print GATT handle diagnostic |
 | `help` | Show command list |
 
 ### Timed Commands
@@ -113,7 +125,7 @@ Send commands via Serial Monitor or publish to the MQTT topic (`lazboy/command` 
 Append `:ms` to any motor command to run it for a specific duration:
 
 ```
-head_up:500      # Half second
+head_up:500       # Half second
 recline_down:3000 # Three seconds
 lumbar_up:250     # Quarter second
 ```
@@ -122,10 +134,9 @@ lumbar_up:250     # Quarter second
 
 ### MQTT
 
-With WiFi and MQTT configured, you can control the chair from Home Assistant using MQTT publishes:
+With WiFi and MQTT configured, control the chair from Home Assistant:
 
 ```yaml
-# Example: Button in HA
 mqtt:
   button:
     - name: "La-Z-Boy Home"
@@ -163,15 +174,15 @@ automation:
 
 | UUID | Role | Properties |
 |------|------|------------|
-| `826c364a-1005-11e8-b642-0ed5f89f718b` | Primary Service | — |
-| `826c3d34-...` | Notify Characteristic | Read, Notify |
-| `826c3fc8-...` | Write Characteristic | Write, Write No Response |
-| `826c4248-...` | Bidirectional Characteristic | Write, Write No Response, Notify |
-| `826c44c8-...` | Read Characteristic | Read |
+| `826c364a-...` | Primary Service | - |
+| `826c3d34-...` | Notify | Read, Notify |
+| `826c3fc8-...` | Write | Write, Write No Response |
+| `826c4248-...` | Bidirectional | Write, Write No Response, Notify |
+| `826c44c8-...` | Read | Read |
 
 ### Command Packet Format
 
-Commands are sent as 20-byte packets (padded with zeros). The first 3–4 bytes carry the command:
+Commands are 20-byte packets (zero-padded). The first 3-4 bytes carry the command:
 
 | Byte | Meaning |
 |------|---------|
@@ -204,43 +215,44 @@ Commands are sent as 20-byte packets (padded with zeros). The first 3–4 bytes 
 Saving a preset uses a 3-packet sequence with precise timing (captured from the original remote):
 
 ```
-T=0.0s  → Press:   [ID] 09 00 [modifier]   (single packet)
-T=2.0s  → Hold:    [ID] 03 00 [modifier]   (single packet)
-T=3.6s  → Release: [ID] 0A 00 00           (single packet)
+T=0.0s  -> Press:   [ID] 09 00 [modifier]   (single packet)
+T=2.0s  -> Hold:    [ID] 03 00 [modifier]   (single packet)
+T=3.6s  -> Release: [ID] 0A 00 00           (single packet)
 ```
 
 This differs from motor commands which send continuous press packets every 50ms.
-
-### GATT Handle Alignment
-
-The chair caches GATT handles after bonding and expects the notify characteristic at a specific handle (`0x000D` observed). A **padding service** with a dummy characteristic and descriptors is inserted before the La-Z-Boy service to push the handles to the correct offsets. Without this, the chair bonds but never receives notifications.
 
 ## Troubleshooting
 
 **Chair won't connect:**
 - Verify the MAC address is correct (BLE MAC = base + 2)
-- Factory reset the chair's pairing (unplug, hold Home on original remote, plug in)
+- Factory reset the chair's pairing
 - Run `wipe` command to clear ESP32 bonds, then power cycle the chair
 
-**Chair connects but no response to commands:**
-- Check Serial Monitor for "Ready for commands!" message
-- If authentication fails, the handle alignment may be wrong — this sketch includes the padding service that works with tested chairs
+**Chair connects but commands are ignored:**
+- Type `handles` — if Notify VALUE isn't `0x000D`, the NimBLE patch isn't applied correctly
+- Run `./setup.sh` again or see `patches/README.md` for manual steps
+- Make sure you ran `wipe` and factory reset the chair after any firmware change
 
 **MQTT not connecting:**
 - Verify WiFi credentials and MQTT broker address
-- Check that the broker allows the connection (firewall, ACLs)
+- Check that the broker allows the connection
+
+**Handles show 0x0000:**
+- Normal for some NimBLE versions at boot — type `handles` after the chair connects
 
 ## Project Background
 
 This project is the result of extensive BLE reverse engineering of the La-Z-Boy wireless remote protocol. Key discoveries:
 
-- The chair acts as BLE **Central** (unusual — most BLE furniture accessories are peripherals)
-- The remote acts as BLE **Peripheral**, advertising and waiting for the chair to connect
+- The chair acts as BLE **central** (unusual for furniture)
+- The remote acts as BLE **peripheral**, advertising for the chair to connect
 - Commands are sent via GATT **notifications** (not writes)
-- The chair aggressively caches GATT handles after bonding, requiring exact handle alignment
+- The chair **hardcodes GATT handle positions** and never re-discovers after bonding
 - Save-preset uses a distinct 3-packet hold sequence, not continuous transmission
+- NimBLE's Service Changed characteristic must be removed to achieve correct handle alignment
 
-The BLE protocol analysis was done using nRF Connect, Wireshark with BLE sniffing, and Ghidra for firmware analysis.
+The BLE protocol was analyzed using nRF Connect, HCI snoop logs, and Wireshark.
 
 ## License
 

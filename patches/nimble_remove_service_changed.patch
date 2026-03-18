@@ -1,0 +1,34 @@
+--- a/src/nimble/nimble/host/services/gatt/src/ble_svc_gatt.c
++++ b/src/nimble/nimble/host/services/gatt/src/ble_svc_gatt.c
+@@ -58,12 +58,17 @@
+ static const struct ble_gatt_svc_def ble_svc_gatt_defs[] = {
+     {
+         /*** Service: GATT */
+         .type = BLE_GATT_SVC_TYPE_PRIMARY,
+         .uuid = BLE_UUID16_DECLARE(BLE_GATT_SVC_UUID16),
+-        .characteristics = (struct ble_gatt_chr_def[]) { {
++        .characteristics = (struct ble_gatt_chr_def[]) {
++        /* Service Changed characteristic REMOVED to save 3 GATT handles.
++         * La-Z-Boy chairs hardcode handle positions and expect the notify
++         * VALUE characteristic at handle 0x000D. Removing this frees
++         * handles 0x0007-0x0009 (declaration + value + CCCD).
++         */
++        /*{
+             .uuid = BLE_UUID16_DECLARE(BLE_SVC_GATT_CHR_SERVICE_CHANGED_UUID16),
+             .access_cb = ble_svc_gatt_access,
+             .val_handle = &ble_svc_gatt_changed_val_handle,
+             .flags = BLE_GATT_CHR_F_INDICATE,
+-        },
++        },*/
+         {
+             .uuid = BLE_UUID16_DECLARE(BLE_SVC_GATT_CHR_SERVER_SUPPORTED_FEAT_UUID16),
+             .access_cb = ble_svc_gatt_srv_sup_feat_access,
+@@ -186,6 +191,8 @@
+ void
+ ble_svc_gatt_changed(uint16_t start_handle, uint16_t end_handle)
+ {
++    /* Skip if Service Changed characteristic was removed */
++    if (ble_svc_gatt_changed_val_handle == 0) return;
+     ble_svc_gatt_start_handle = start_handle;
+     ble_svc_gatt_end_handle = end_handle;
+     ble_gatts_chr_updated(ble_svc_gatt_changed_val_handle);
